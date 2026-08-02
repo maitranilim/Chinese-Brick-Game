@@ -1,0 +1,50 @@
+name: Build APK
+
+# Run it by hand from the Actions tab, or let it run on every push to main.
+# The finished APK is attached to the run as a downloadable artifact.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # ubuntu-latest ships the Android SDK, but this pins the command line
+      # tools and accepts the licences the Gradle build needs.
+      - uses: android-actions/setup-android@v3
+
+      - run: npm ci
+
+      # Typechecks and bundles the web build into dist/.
+      - run: npm run build
+
+      # android/ is gitignored, so the native project is generated fresh here.
+      - run: npx cap add android
+
+      - run: npx cap sync android
+
+      - name: Assemble debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brick-game-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
