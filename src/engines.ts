@@ -231,6 +231,9 @@ class FallingBlocksEngine extends BaseEngine {
       for (let x = 0; x < GRID_COLS; x += 1) {
         this.board[y][x] = this.rng.next() > 0.31 ? 1 : 0;
       }
+      // A seeded row must never start complete: the first lock would wipe it and
+      // hand out a line bonus the player never earned.
+      if (this.board[y].every(Boolean)) this.board[y][this.rng.int(GRID_COLS)] = 0;
     }
   }
 
@@ -410,21 +413,22 @@ class BreakoutEngine extends BaseEngine {
     this.ticks = 0;
 
     let nextX = this.ball.x + this.velocity.x;
-    let nextY = this.ball.y + this.velocity.y;
     if (nextX < 0 || nextX >= GRID_COLS) {
       this.velocity.x *= -1;
       nextX = this.ball.x + this.velocity.x;
     }
-    if (nextY < 0) {
-      this.velocity.y = 1;
-      nextY = this.ball.y + this.velocity.y;
-    }
+    let nextY = this.stepY();
 
-    if (nextY >= 0 && nextY < this.bricks.length && this.bricks[nextY][nextX]) {
+    if (this.isBrick(nextX, nextY)) {
       this.bricks[nextY][nextX] = false;
       this.velocity.y *= -1;
       this.score += 10 * this.variant.difficulty;
       this.cue("hit");
+      // Bounce away from the brick instead of drifting into the cell that was
+      // just cleared, which used to leave the ball travelling against its own
+      // velocity for a tick.
+      nextY = this.stepY();
+      if (this.isBrick(nextX, nextY)) nextY = this.ball.y;
     }
 
     if (this.velocity.y > 0 && nextY === this.paddleY) {
@@ -474,6 +478,17 @@ class BreakoutEngine extends BaseEngine {
 
   preview(): PixelCell[] {
     return [{ x: 1, y: 1 }, { x: 2, y: 2 }, { x: 1, y: 3 }, { x: 2, y: 3 }];
+  }
+
+  private stepY(): number {
+    const candidate = this.ball.y + this.velocity.y;
+    if (candidate >= 0) return candidate;
+    this.velocity.y = 1;
+    return this.ball.y + this.velocity.y;
+  }
+
+  private isBrick(x: number, y: number): boolean {
+    return y >= 0 && y < this.bricks.length && x >= 0 && x < GRID_COLS && this.bricks[y][x];
   }
 
   private buildBricks(): void {
@@ -541,15 +556,14 @@ class TankShooterEngine extends BaseEngine {
       if (!this.enemies.some((enemy) => enemy.x === x && enemy.y < 3)) this.enemies.push({ x, y: 0 });
     }
 
-    const playerCells = this.tankCells(this.player);
-    const hit = this.enemyShots.some((shot) => playerCells.some((cell) => cell.x === shot.x && cell.y === shot.y))
-      || this.enemies.some((enemy) => this.tankCells(enemy).some((enemyCell) => playerCells.some((cell) => cell.x === enemyCell.x && cell.y === enemyCell.y)));
-    if (hit) this.gameOver = true;
+    if (this.playerIsHit()) this.gameOver = true;
   }
 
   control(control: Control): void {
-    if (control === "rotate" || control === "up") {
-      if (this.shotCooldown === 0) {
+    if (control === "rotate") {
+      // ROTATE fires; the D-pad is left free to drive the tank in all four
+      // directions, so UP is no longer a one-way trip to the bottom row.
+      if (this.shotCooldown === 0 && this.player.y > 0) {
         this.playerShots.push({ x: this.player.x + 1, y: this.player.y - 1 });
         this.shotCooldown = 2;
         this.cue("move");
@@ -559,6 +573,7 @@ class TankShooterEngine extends BaseEngine {
     const deltas: Partial<Record<Control, Point>> = {
       left: { x: -1, y: 0 },
       right: { x: 1, y: 0 },
+      up: { x: 0, y: -1 },
       down: { x: 0, y: 1 },
     };
     const delta = deltas[control];
@@ -567,6 +582,16 @@ class TankShooterEngine extends BaseEngine {
     if (next.x < 0 || next.x > GRID_COLS - 2 || next.y < 0 || next.y > GRID_ROWS - 2 || this.tankCells(next).some((cell) => this.isObstacle(cell))) return;
     this.player = next;
     this.cue("move");
+    // Driving into an enemy or a live shell has to count, otherwise the tank
+    // can share a cell with one until it moves away again.
+    if (this.playerIsHit()) this.gameOver = true;
+  }
+
+  private playerIsHit(): boolean {
+    const playerCells = this.tankCells(this.player);
+    const overlaps = (cell: Point) => playerCells.some((part) => part.x === cell.x && part.y === cell.y);
+    return this.enemyShots.some(overlaps)
+      || this.enemies.some((enemy) => this.tankCells(enemy).some(overlaps));
   }
 
   cells(): PixelCell[] {
@@ -603,6 +628,9 @@ class TankShooterEngine extends BaseEngine {
 
 type TrafficCar = { lane: number; y: number };
 
+const PLAYER_TOP = GRID_ROWS - 2;
+const PLAYER_BOTTOM = GRID_ROWS - 1;
+
 class CarDodgeEngine extends BaseEngine {
   readonly kind = "dodge" as const;
   private readonly laneXs = [1, 3, 5, 7];
@@ -619,7 +647,7 @@ class CarDodgeEngine extends BaseEngine {
     this.score += 1;
     this.spawnTicks += 1;
     this.cars = this.cars.map((car) => ({ ...car, y: car.y + 1 }));
-    if (this.cars.some((car) => car.lane === this.lane && car.y >= 17 && car.y <= 19)) {
+    if (this.crashed()) {
       this.gameOver = true;
       return;
     }
@@ -637,11 +665,20 @@ class CarDodgeEngine extends BaseEngine {
     if (control === "left" && this.lane > 0) {
       this.lane -= 1;
       this.cue("move");
-    }
-    if (control === "right" && this.lane < this.laneXs.length - 1) {
+    } else if (control === "right" && this.lane < this.laneXs.length - 1) {
       this.lane += 1;
       this.cue("move");
+    } else {
+      return;
     }
+    // Swerving into an occupied lane is a crash. Without this the car simply
+    // overlapped the traffic until the offending car scrolled off the bottom.
+    if (this.crashed()) this.gameOver = true;
+  }
+
+  /** The player fills rows 18-19, traffic fills car.y and car.y + 1. */
+  private crashed(): boolean {
+    return this.cars.some((car) => car.lane === this.lane && car.y <= PLAYER_BOTTOM && car.y + 1 >= PLAYER_TOP);
   }
 
   cells(): PixelCell[] {
@@ -656,7 +693,7 @@ class CarDodgeEngine extends BaseEngine {
       output.push({ x, y: car.y, strength: 0.82 }, { x, y: car.y + 1, strength: 0.82 });
     }
     const playerX = this.laneXs[this.lane];
-    output.push({ x: playerX, y: 18, strength: 0.98 }, { x: playerX, y: 19, strength: 0.98 });
+    output.push({ x: playerX, y: PLAYER_TOP, strength: 0.98 }, { x: playerX, y: PLAYER_BOTTOM, strength: 0.98 });
     return output;
   }
 
@@ -685,11 +722,38 @@ class RacingLanesEngine extends BaseEngine {
     this.ticks += 1;
     if (this.ticks < this.variant.startSpeed) return;
     this.ticks = 0;
+    this.advance();
+  }
+
+  control(control: Control): void {
+    if (control === "up") {
+      // Accelerating now scrolls the road for real. It used to hand out four
+      // points per press with no risk, which let a held UP button farm an
+      // unbeatable high score without the car ever moving.
+      this.ticks = 0;
+      this.advance();
+      this.cue("move");
+      return;
+    }
+    if (control === "left" && this.lane > 0) {
+      this.lane -= 1;
+      this.cue("move");
+    } else if (control === "right" && this.lane < this.laneCount - 1) {
+      this.lane += 1;
+      this.cue("move");
+    } else {
+      return;
+    }
+    if (this.crashed()) this.gameOver = true;
+  }
+
+  private advance(): void {
+    if (this.gameOver) return;
     this.scroll += 1;
     this.score += 2 * this.variant.difficulty;
     this.spawnTicks += 1;
     this.traffic = this.traffic.map((car) => ({ ...car, y: car.y + 1 }));
-    if (this.traffic.some((car) => car.lane === this.lane && car.y >= 17 && car.y <= 19)) {
+    if (this.crashed()) {
       this.gameOver = true;
       return;
     }
@@ -701,19 +765,8 @@ class RacingLanesEngine extends BaseEngine {
     }
   }
 
-  control(control: Control): void {
-    if (control === "left" && this.lane > 0) {
-      this.lane -= 1;
-      this.cue("move");
-    }
-    if (control === "right" && this.lane < this.laneCount - 1) {
-      this.lane += 1;
-      this.cue("move");
-    }
-    if (control === "up") {
-      this.score += 4;
-      this.cue("move");
-    }
+  private crashed(): boolean {
+    return this.traffic.some((car) => car.lane === this.lane && car.y <= PLAYER_BOTTOM && car.y + 1 >= PLAYER_TOP);
   }
 
   cells(): PixelCell[] {
@@ -730,8 +783,8 @@ class RacingLanesEngine extends BaseEngine {
       const x = this.roadLeft(car.y) + car.lane * 2;
       output.push({ x, y: car.y, strength: 0.8 }, { x, y: car.y + 1, strength: 0.8 });
     }
-    const playerX = this.roadLeft(18) + this.lane * 2;
-    output.push({ x: playerX, y: 18, strength: 0.98 }, { x: playerX, y: 19, strength: 0.98 });
+    const playerX = this.roadLeft(PLAYER_TOP) + this.lane * 2;
+    output.push({ x: playerX, y: PLAYER_TOP, strength: 0.98 }, { x: playerX, y: PLAYER_BOTTOM, strength: 0.98 });
     return output;
   }
 

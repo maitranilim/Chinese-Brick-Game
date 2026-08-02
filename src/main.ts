@@ -77,6 +77,8 @@ class BrickGame {
   private runningVariant: Variant | null = null;
   private runNumber = 0;
   private tickNumber = 0;
+  private readonly bestScores = new Map<number, number>();
+  private unsavedBest: number | null = null;
 
   constructor(renderer: LcdRenderer, audio: SquareAudio, status: HTMLElement, soundButton: HTMLButtonElement) {
     this.renderer = renderer;
@@ -102,6 +104,7 @@ class BrickGame {
       if (this.powered && this.state === "playing" && this.engine && !this.engine.gameOver) {
         this.paused = !this.paused;
         this.audio.play("move");
+        if (this.paused) this.flushBest();
       }
       this.render();
       return;
@@ -115,25 +118,35 @@ class BrickGame {
   }
 
   autoPause(): void {
-    if (document.hidden && this.state === "playing" && !this.paused && this.engine && !this.engine.gameOver) {
+    if (!document.hidden) return;
+    this.flushBest();
+    if (this.state === "playing" && !this.paused && this.engine && !this.engine.gameOver) {
       this.paused = true;
       this.render();
     }
   }
 
+  /** Last chance to persist a best score before the page or app goes away. */
+  persist(): void {
+    this.flushBest();
+  }
+
   private onTick(): void {
     this.tickNumber += 1;
     if (this.powered && this.state === "playing" && this.engine && !this.paused && !this.engine.gameOver) {
-      const wasOver = this.engine.gameOver;
       this.engine.tick();
       this.playEngineSounds();
       this.saveBestIfNeeded();
-      if (!wasOver && this.engine.gameOver) this.audio.play("gameover");
+      if (this.engine.gameOver) {
+        this.audio.play("gameover");
+        this.flushBest();
+      }
     }
     this.render();
   }
 
   private togglePower(): void {
+    this.flushBest();
     this.powered = !this.powered;
     if (this.powered) {
       this.state = "select";
@@ -171,15 +184,18 @@ class BrickGame {
       return;
     }
     if (this.paused) return;
-    const wasOver = this.engine.gameOver;
     this.engine.control(control);
     this.playEngineSounds();
     this.saveBestIfNeeded();
-    if (!wasOver && this.engine.gameOver) this.audio.play("gameover");
+    if (this.engine.gameOver) {
+      this.audio.play("gameover");
+      this.flushBest();
+    }
     this.render();
   }
 
   private startGame(): void {
+    this.flushBest();
     const variant = this.selectedVariant();
     this.runningVariant = variant;
     this.engine = createEngine(variant, this.runNumber);
@@ -200,20 +216,38 @@ class BrickGame {
   }
 
   private bestScore(index: number): number {
+    const cached = this.bestScores.get(index);
+    if (cached !== undefined) return cached;
+    let stored = 0;
     try {
       const parsed = Number(window.localStorage.getItem(`brickgame.hi.${index}`));
-      return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+      if (Number.isFinite(parsed) && parsed > 0) stored = Math.floor(parsed);
     } catch {
-      return 0;
+      stored = 0;
     }
+    this.bestScores.set(index, stored);
+    return stored;
   }
 
+  /**
+   * Scoring engines add points on every step, so writing straight through to
+   * localStorage meant ten synchronous writes a second for the whole run. The
+   * best score is tracked in memory and flushed only when a run pauses or ends.
+   */
   private saveBestIfNeeded(): void {
     if (!this.engine || !this.runningVariant) return;
-    const current = this.bestScore(this.runningVariant.index);
-    if (this.engine.score <= current) return;
+    const index = this.runningVariant.index;
+    if (this.engine.score <= this.bestScore(index)) return;
+    this.bestScores.set(index, this.engine.score);
+    this.unsavedBest = index;
+  }
+
+  private flushBest(): void {
+    const index = this.unsavedBest;
+    if (index === null) return;
+    this.unsavedBest = null;
     try {
-      window.localStorage.setItem(`brickgame.hi.${this.runningVariant.index}`, String(this.engine.score));
+      window.localStorage.setItem(`brickgame.hi.${index}`, String(this.bestScores.get(index) ?? 0));
     } catch {
       // Private browsing can disable storage. Play remains fully functional.
     }
@@ -309,15 +343,27 @@ if (!canvas || !status || !soundButton) throw new Error("Required console contro
 
 const game = new BrickGame(new LcdRenderer(canvas), new SquareAudio(), status, soundButton);
 const directional = new Set<Command>(["left", "right", "up", "down"]);
-let heldDelay: number | undefined;
-let heldRepeat: number | undefined;
 
-function clearHold(button?: HTMLButtonElement): void {
-  if (heldDelay !== undefined) window.clearTimeout(heldDelay);
-  if (heldRepeat !== undefined) window.clearInterval(heldRepeat);
-  heldDelay = undefined;
-  heldRepeat = undefined;
-  button?.classList.remove("is-held");
+/**
+ * Auto-repeat timers are tracked per button. A single shared pair of handles
+ * meant a second finger overwrote the first button's handles, orphaning its
+ * interval so the console kept receiving that direction forever.
+ */
+type Hold = { delay?: number; repeat?: number };
+const holds = new Map<HTMLButtonElement, Hold>();
+
+function clearHold(button: HTMLButtonElement): void {
+  const hold = holds.get(button);
+  if (hold) {
+    if (hold.delay !== undefined) window.clearTimeout(hold.delay);
+    if (hold.repeat !== undefined) window.clearInterval(hold.repeat);
+    holds.delete(button);
+  }
+  button.classList.remove("is-held");
+}
+
+function clearAllHolds(): void {
+  for (const button of [...holds.keys()]) clearHold(button);
 }
 
 function isCommand(value: string | undefined): value is Command {
@@ -330,14 +376,20 @@ for (const button of document.querySelectorAll<HTMLButtonElement>("[data-command
     const command = button.dataset.command;
     if (!isCommand(command)) return;
     event.preventDefault();
+    clearHold(button);
     button.classList.add("is-held");
-    button.setPointerCapture(event.pointerId);
-    game.command(command);
-    if (directional.has(command)) {
-      heldDelay = window.setTimeout(() => {
-        heldRepeat = window.setInterval(() => game.command(command), 115);
-      }, 260);
+    try {
+      button.setPointerCapture(event.pointerId);
+    } catch {
+      // A pointer can be gone before capture is requested; the game still runs.
     }
+    game.command(command);
+    if (!directional.has(command)) return;
+    const hold: Hold = {};
+    holds.set(button, hold);
+    hold.delay = window.setTimeout(() => {
+      hold.repeat = window.setInterval(() => game.command(command), 115);
+    }, 260);
   });
   for (const eventName of ["pointerup", "pointercancel", "lostpointercapture"] as const) {
     button.addEventListener(eventName, () => clearHold(button));
@@ -367,4 +419,14 @@ document.addEventListener("keydown", (event) => {
   game.command(command);
 });
 
-document.addEventListener("visibilitychange", () => game.autoPause());
+// Losing focus mid-press never delivers a pointerup, so a held direction would
+// otherwise keep repeating after the app is backgrounded.
+window.addEventListener("blur", clearAllHolds);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) clearAllHolds();
+  game.autoPause();
+});
+window.addEventListener("pagehide", () => {
+  clearAllHolds();
+  game.persist();
+});
