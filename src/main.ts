@@ -73,6 +73,9 @@ class BrickGame {
   private paused = false;
   private selectedIndex = 1;
   private difficulty = 1;
+  private scrollDirection: "left" | "right" | null = null;
+  private scrollStreak = 0;
+  private lastScrollAt = 0;
   private engine: GameEngine | null = null;
   private runningVariant: Variant | null = null;
   private runNumber = 0;
@@ -95,26 +98,46 @@ class BrickGame {
       this.togglePower();
       return;
     }
+    // Every other button is dead while the console is off, the same as the
+    // real hardware: there is no jingle, no reset, no D-pad until it's on.
+    if (!this.powered) return;
     if (command === "sound") {
       this.soundButton.setAttribute("aria-pressed", String(this.audio.toggle()));
       this.render();
       return;
     }
     if (command === "pause") {
-      if (this.powered && this.state === "playing" && this.engine && !this.engine.gameOver) {
-        this.paused = !this.paused;
-        this.audio.play("move");
-        if (this.paused) this.flushBest();
-      }
-      this.render();
+      this.handleStartPause();
       return;
     }
     if (command === "reset") {
-      this.powered = true;
       this.startGame();
       return;
     }
     this.handleGameControl(command);
+  }
+
+  /**
+   * S/P is printed as a combined Start/Pause button, so it has to behave like
+   * one on every screen: start from the selector, pause mid-run, and restart
+   * after game over. ROTATE still does the same on the selector and on game
+   * over, matching its own "START / ROTATE" label -- two ways in is normal
+   * on the real hardware, a button whose printed name does nothing is not.
+   */
+  private handleStartPause(): void {
+    if (this.state === "select") {
+      this.startGame();
+      return;
+    }
+    if (!this.engine) return;
+    if (this.engine.gameOver) {
+      this.startGame();
+      return;
+    }
+    this.paused = !this.paused;
+    this.audio.play("move");
+    if (this.paused) this.flushBest();
+    this.render();
   }
 
   autoPause(): void {
@@ -164,10 +187,8 @@ class BrickGame {
   }
 
   private handleGameControl(control: Control): void {
-    if (!this.powered) return;
     if (this.state === "select") {
-      if (control === "left") this.selectedIndex = this.selectedIndex === 1 ? 9999 : this.selectedIndex - 1;
-      if (control === "right") this.selectedIndex = this.selectedIndex === 9999 ? 1 : this.selectedIndex + 1;
+      if (control === "left" || control === "right") this.scrollSelection(control);
       if (control === "up") this.difficulty = this.difficulty === 3 ? 1 : this.difficulty + 1;
       if (control === "down") this.difficulty = this.difficulty === 1 ? 3 : this.difficulty - 1;
       if (control === "rotate") {
@@ -192,6 +213,27 @@ class BrickGame {
       this.flushBest();
     }
     this.render();
+  }
+
+  /**
+   * A held direction fast-forwards through the 9999 slots like the number
+   * dial on the real hardware: step 1 at first, then 10, then 100, so the
+   * far end of the range is reachable in seconds instead of the ~19 minutes
+   * a flat one-at-a-time step would take at the D-pad's repeat rate.
+   */
+  private scrollSelection(control: "left" | "right"): void {
+    const now = Date.now();
+    const held = control === this.scrollDirection && now - this.lastScrollAt < 400;
+    this.scrollStreak = held ? this.scrollStreak + 1 : 0;
+    this.scrollDirection = control;
+    this.lastScrollAt = now;
+    const step = this.scrollStreak >= 24 ? 100 : this.scrollStreak >= 8 ? 10 : 1;
+    this.selectedIndex = this.wrapIndex(this.selectedIndex + (control === "left" ? -step : step));
+  }
+
+  private wrapIndex(value: number): number {
+    const span = 9999;
+    return ((((value - 1) % span) + span) % span) + 1;
   }
 
   private startGame(): void {
@@ -330,7 +372,7 @@ app.innerHTML = `
           <div class="rotate-label">START / ROTATE</div>
         </div>
       </div>
-      <p class="help-line">ARROWS: MOVE / SELECT · Z OR SPACE: ROTATE · P: PAUSE · R: RESET</p>
+      <p class="help-line">ARROWS: MOVE / SELECT · Z OR SPACE: ROTATE · P: START/PAUSE · R: RESET · M: SOUND · ENTER: POWER</p>
       <p id="status" class="sr-only" aria-live="polite"></p>
     </section>
   </section>
