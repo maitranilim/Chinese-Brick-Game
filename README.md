@@ -45,9 +45,3 @@ cd android && ./gradlew assembleDebug
 ```
 
 The Android app is locked to portrait mode.
-
-## Creator
-
-Created by [maitranilim](https://github.com/maitranilim).
-
-See [CONTRIBUTORS.md](CONTRIBUTORS.md) for the contributor list.
